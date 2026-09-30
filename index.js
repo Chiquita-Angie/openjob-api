@@ -11,12 +11,22 @@ const host = process.env.HOST || 'localhost';
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
+app.use((req, res, next) => {
+  console.log(`[${req.method}] ${req.url}`);
+  next();
+});
 
 // --- MIDDLEWARE AUTENTIKASI (Satpam Token) ---
 const verifyToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      status: 'failed',
+      message: 'Missing authentication',
+    });
+  }
+
+  const token = authHeader.split(' ')[1];
   if (!token) {
     return res.status(401).json({
       status: 'failed',
@@ -26,8 +36,8 @@ const verifyToken = (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.ACCESS_TOKEN_KEY);
-    req.user = decoded; 
-    next(); 
+    req.user = decoded;
+    next();
   } catch (error) {
     return res.status(401).json({
       status: 'failed',
@@ -36,14 +46,30 @@ const verifyToken = (req, res, next) => {
   }
 };
 
-// --- ENDPOINT REGISTER USER ---
+// --- MIDDLEWARE VALIDASI DATA JOI ---
+const validate = (schema) => (req, res, next) => {
+  const { error } = schema.validate(req.body);
+  if (error) {
+    return res.status(400).json({
+      status: 'failed',
+      message: error.details[0].message,
+    });
+  }
+  next();
+};
+
+// ==========================================
+// 1. ENDPOINT USERS
+// ==========================================
+
+// Register User
 app.post('/users', async (req, res) => {
   try {
     const schema = Joi.object({
       name: Joi.string().required(),
       email: Joi.string().email().required(),
       password: Joi.string().min(6).required(),
-      role: Joi.string().optional()
+      role: Joi.string().optional(),
     }).unknown(true);
 
     const { error } = schema.validate(req.body);
@@ -54,7 +80,7 @@ app.post('/users', async (req, res) => {
       });
     }
 
-    const { name, email, password } = req.body;
+    const { name, email, password, role = 'user' } = req.body;
 
     const checkEmail = await pool.query('SELECT email FROM users WHERE email = $1', [email]);
     if (checkEmail.rows.length > 0) {
@@ -67,10 +93,10 @@ app.post('/users', async (req, res) => {
     const id = `user-${crypto.randomUUID()}`;
     const hashedPassword = await bcrypt.hash(password, 10);
     const createdAt = new Date().toISOString();
-    
+
     const query = {
-      text: 'INSERT INTO users(id, fullname, email, password, created_at, updated_at) VALUES($1, $2, $3, $4, $5, $6) RETURNING id',
-      values: [id, name, email, hashedPassword, createdAt, createdAt],
+      text: 'INSERT INTO users(id, fullname, email, password, role, created_at, updated_at) VALUES($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+      values: [id, name, email, hashedPassword, role, createdAt, createdAt],
     };
 
     const result = await pool.query(query);
@@ -78,7 +104,7 @@ app.post('/users', async (req, res) => {
     res.status(201).json({
       status: 'success',
       data: {
-        userId: result.rows[0].id,
+        id: result.rows[0].id,
       },
     });
   } catch (error) {
@@ -90,41 +116,46 @@ app.post('/users', async (req, res) => {
   }
 });
 
-// --- ENDPOINT GET USER BY ID ---
+// Get User by ID
 app.get('/users/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
-    // Menyesuaikan balikan fullname menjadi name sesuai kontrak
+
     const query = {
       text: 'SELECT id, fullname AS name, email FROM users WHERE id = $1',
-      values: [id]
+      values: [id],
     };
     const result = await pool.query(query);
 
     if (result.rows.length === 0) {
       return res.status(404).json({
         status: 'failed',
-        message: 'User tidak ditemukan'
+        message: 'User tidak ditemukan',
       });
     }
 
     res.status(200).json({
       status: 'success',
       data: {
-        user: result.rows[0]
-      }
+        id: result.rows[0].id,
+        name: result.rows[0].name,
+        email: result.rows[0].email,
+      },
     });
   } catch (error) {
     console.error(error);
     res.status(500).json({
       status: 'error',
-      message: 'Terjadi kegagalan pada server kami'
+      message: 'Terjadi kegagalan pada server kami',
     });
   }
 });
 
-// --- ENDPOINT LOGIN / AUTHENTICATIONS ---
+// ==========================================
+// 2. ENDPOINT AUTHENTICATIONS
+// ==========================================
+
+// Login
 app.post('/authentications', async (req, res) => {
   try {
     const schema = Joi.object({
@@ -170,7 +201,6 @@ app.post('/authentications', async (req, res) => {
 
     await pool.query('INSERT INTO authentications(token) VALUES($1)', [refreshToken]);
 
-    // Mengubah status dari 201 menjadi 200 sesuai permintaan reviewer
     res.status(200).json({
       status: 'success',
       data: {
@@ -187,7 +217,7 @@ app.post('/authentications', async (req, res) => {
   }
 });
 
-// --- ENDPOINT PUT /authentications (Refresh Token) ---
+// Refresh Token
 app.put('/authentications', async (req, res) => {
   try {
     const schema = Joi.object({
@@ -204,6 +234,16 @@ app.put('/authentications', async (req, res) => {
 
     const { refreshToken } = req.body;
 
+    let decoded;
+    try {
+      decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_KEY);
+    } catch (err) {
+      return res.status(400).json({
+        status: 'failed',
+        message: 'Refresh token tidak valid',
+      });
+    }
+
     const checkToken = await pool.query('SELECT token FROM authentications WHERE token = $1', [refreshToken]);
     if (checkToken.rows.length === 0) {
       return res.status(400).json({
@@ -212,25 +252,24 @@ app.put('/authentications', async (req, res) => {
       });
     }
 
-    const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_KEY);
     const accessToken = jwt.sign({ id: decoded.id }, process.env.ACCESS_TOKEN_KEY, { expiresIn: '3h' });
 
     res.status(200).json({
       status: 'success',
-      message: 'Access Token berhasil diperbarui',
       data: {
         accessToken,
       },
     });
   } catch (error) {
-    return res.status(400).json({
-      status: 'failed',
-      message: 'Refresh token tidak valid',
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
     });
   }
 });
 
-// --- ENDPOINT DELETE /authentications (Logout) ---
+// Logout
 app.delete('/authentications', async (req, res) => {
   try {
     const schema = Joi.object({
@@ -270,16 +309,20 @@ app.delete('/authentications', async (req, res) => {
   }
 });
 
-// --- ENDPOINT POST /companies ---
+// ==========================================
+// 3. ENDPOINT COMPANIES
+// ==========================================
+
+const companySchema = Joi.object({
+  name: Joi.string().required(),
+  location: Joi.string().required(),
+  description: Joi.string().required(),
+});
+
+// Create Company
 app.post('/companies', verifyToken, async (req, res) => {
   try {
-    const schema = Joi.object({
-      name: Joi.string().required(),
-      location: Joi.string().required(),
-      description: Joi.string().required(),
-    });
-
-    const { error } = schema.validate(req.body);
+    const { error } = companySchema.validate(req.body);
     if (error) {
       return res.status(400).json({
         status: 'failed',
@@ -288,7 +331,6 @@ app.post('/companies', verifyToken, async (req, res) => {
     }
 
     const { name, location, description } = req.body;
-    
     const id = `company-${crypto.randomUUID()}`;
     const createdAt = new Date().toISOString();
 
@@ -304,7 +346,7 @@ app.post('/companies', verifyToken, async (req, res) => {
       data: {
         id: result.rows[0].id,
       },
-  });
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({
@@ -314,7 +356,7 @@ app.post('/companies', verifyToken, async (req, res) => {
   }
 });
 
-// --- ENDPOINT GET ALL COMPANIES ---
+// Get All Companies
 app.get('/companies', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM companies');
@@ -333,12 +375,12 @@ app.get('/companies', async (req, res) => {
   }
 });
 
-// --- ENDPOINT GET COMPANY BY ID ---
+// Get Company by ID
 app.get('/companies/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query('SELECT * FROM companies WHERE id = $1', [id]);
-    
+
     if (result.rows.length === 0) {
       return res.status(404).json({
         status: 'failed',
@@ -348,9 +390,7 @@ app.get('/companies/:id', async (req, res) => {
 
     res.status(200).json({
       status: 'success',
-      data: {
-        company: result.rows[0],
-      },
+      data: result.rows[0],
     });
   } catch (error) {
     console.error(error);
@@ -361,18 +401,26 @@ app.get('/companies/:id', async (req, res) => {
   }
 });
 
-// --- ENDPOINT PUT /companies/:id (Update) ---
+// Update Company
 app.put('/companies/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
-    
-    const schema = Joi.object({
-      name: Joi.string().required(),
-      location: Joi.string().required(),
-      description: Joi.string().required(),
+
+    const checkCompany = await pool.query('SELECT * FROM companies WHERE id = $1', [id]);
+    if (checkCompany.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Perusahaan tidak ditemukan',
+      });
+    }
+
+    const updateCompanySchema = Joi.object({
+      name: Joi.string().optional(),
+      location: Joi.string().optional(),
+      description: Joi.string().optional(),
     });
 
-    const { error } = schema.validate(req.body);
+    const { error } = updateCompanySchema.validate(req.body);
     if (error) {
       return res.status(400).json({
         status: 'failed',
@@ -380,7 +428,10 @@ app.put('/companies/:id', verifyToken, async (req, res) => {
       });
     }
 
-    const { name, location, description } = req.body;
+    const current = checkCompany.rows[0];
+    const name = req.body.name !== undefined ? req.body.name : current.name;
+    const location = req.body.location !== undefined ? req.body.location : current.location;
+    const description = req.body.description !== undefined ? req.body.description : current.description;
     const updatedAt = new Date().toISOString();
 
     const query = {
@@ -388,14 +439,7 @@ app.put('/companies/:id', verifyToken, async (req, res) => {
       values: [name, location, description, updatedAt, id],
     };
 
-    const result = await pool.query(query);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        status: 'failed',
-        message: 'Perusahaan tidak ditemukan',
-      });
-    }
+    await pool.query(query);
 
     res.status(200).json({
       status: 'success',
@@ -410,11 +454,10 @@ app.put('/companies/:id', verifyToken, async (req, res) => {
   }
 });
 
-// --- ENDPOINT DELETE /companies/:id ---
+// Delete Company
 app.delete('/companies/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
-    
     const result = await pool.query('DELETE FROM companies WHERE id = $1 RETURNING id', [id]);
 
     if (result.rows.length === 0) {
@@ -437,14 +480,24 @@ app.delete('/companies/:id', verifyToken, async (req, res) => {
   }
 });
 
-// --- ENDPOINT CATEGORIES ---
+// ==========================================
+// 4. ENDPOINT CATEGORIES
+// ==========================================
 
-// 1. POST Add Category
+const categorySchema = Joi.object({
+  name: Joi.string().required(),
+});
+
+// Create Category
 app.post('/categories', verifyToken, async (req, res) => {
   try {
-    const schema = Joi.object({ name: Joi.string().required() });
-    const { error } = schema.validate(req.body);
-    if (error) return res.status(400).json({ status: 'failed', message: error.details[0].message });
+    const { error } = categorySchema.validate(req.body);
+    if (error) {
+      return res.status(400).json({
+        status: 'failed',
+        message: error.details[0].message,
+      });
+    }
 
     const { name } = req.body;
     const id = `category-${crypto.randomUUID()}`;
@@ -456,42 +509,86 @@ app.post('/categories', verifyToken, async (req, res) => {
     };
     const result = await pool.query(query);
 
-    res.status(201).json({ status: 'success', data: { id: result.rows[0].id } });
+    res.status(201).json({
+      status: 'success',
+      data: {
+        id: result.rows[0].id,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 2. GET All Categories
+// Get All Categories
 app.get('/categories', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM categories');
-    res.status(200).json({ status: 'success', data: { categories: result.rows } });
+    res.status(200).json({
+      status: 'success',
+      data: {
+        categories: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 3. GET Category By ID
+// Get Category by ID
 app.get('/categories/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query('SELECT * FROM categories WHERE id = $1', [id]);
-    
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Kategori tidak ditemukan' });
-    res.status(200).json({ status: 'success', data: { category: result.rows[0] } });
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Kategori tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      data: result.rows[0],
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 4. PUT Update Category
+// Update Category
 app.put('/categories/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const schema = Joi.object({ name: Joi.string().required() });
-    const { error } = schema.validate(req.body);
-    if (error) return res.status(400).json({ status: 'failed', message: error.details[0].message });
+
+    const checkCategory = await pool.query('SELECT * FROM categories WHERE id = $1', [id]);
+    if (checkCategory.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Kategori tidak ditemukan',
+      });
+    }
+
+    const { error } = categorySchema.validate(req.body);
+    if (error) {
+      return res.status(400).json({
+        status: 'failed',
+        message: error.details[0].message,
+      });
+    }
 
     const { name } = req.body;
     const updatedAt = new Date().toISOString();
@@ -500,29 +597,50 @@ app.put('/categories/:id', verifyToken, async (req, res) => {
       text: 'UPDATE categories SET name = $1, updated_at = $2 WHERE id = $3 RETURNING id',
       values: [name, updatedAt, id],
     };
-    const result = await pool.query(query);
+    await pool.query(query);
 
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Kategori tidak ditemukan' });
-    res.status(200).json({ status: 'success', message: 'Kategori berhasil diperbarui' });
+    res.status(200).json({
+      status: 'success',
+      message: 'Kategori berhasil diperbarui',
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 5. DELETE Category
+// Delete Category
 app.delete('/categories/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query('DELETE FROM categories WHERE id = $1 RETURNING id', [id]);
 
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Kategori tidak ditemukan' });
-    res.status(200).json({ status: 'success', message: 'Kategori berhasil dihapus' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Kategori tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Kategori berhasil dihapus',
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// --- ENDPOINT JOBS ---
+// ==========================================
+// 5. ENDPOINT JOBS
+// ==========================================
 
 const jobSchema = Joi.object({
   company_id: Joi.string().required(),
@@ -532,161 +650,376 @@ const jobSchema = Joi.object({
   job_type: Joi.string().required(),
   experience_level: Joi.string().required(),
   location_type: Joi.string().required(),
-  location_city: Joi.string().required(),
-  salary_min: Joi.number().required(),
-  salary_max: Joi.number().required(),
-  is_salary_visible: Joi.boolean().required(),
-  status: Joi.string().required()
-});
+  location_city: Joi.string().allow(null, '').optional(),
+  salary_min: Joi.number().allow(null).optional(),
+  salary_max: Joi.number().allow(null).optional(),
+  is_salary_visible: Joi.boolean().optional(),
+  status: Joi.string().required(),
+}).unknown(true);
 
-// 1. POST Add Job
+// Create Job
 app.post('/jobs', verifyToken, async (req, res) => {
   try {
     const { error } = jobSchema.validate(req.body);
-    if (error) return res.status(400).json({ status: 'failed', message: error.details[0].message });
+    if (error) {
+      return res.status(400).json({
+        status: 'failed',
+        message: error.details[0].message,
+      });
+    }
 
-    const { company_id, category_id, title, description, job_type, experience_level, location_type, location_city, salary_min, salary_max, is_salary_visible, status } = req.body;
-    
-    // Cek apakah company dan category ada di database
+    const {
+      company_id,
+      category_id,
+      title,
+      description,
+      job_type,
+      experience_level,
+      location_type,
+      location_city,
+      salary_min,
+      salary_max,
+      is_salary_visible,
+      status,
+    } = req.body;
+
     const checkCompany = await pool.query('SELECT id FROM companies WHERE id = $1', [company_id]);
     const checkCategory = await pool.query('SELECT id FROM categories WHERE id = $1', [category_id]);
-    
+
     if (checkCompany.rows.length === 0 || checkCategory.rows.length === 0) {
-      return res.status(404).json({ status: 'failed', message: 'Company atau Category tidak ditemukan' });
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Company atau Category tidak ditemukan',
+      });
     }
 
     const id = `job-${crypto.randomUUID()}`;
     const createdAt = new Date().toISOString();
 
+    const finalLocationCity = location_city !== undefined ? location_city : '';
+    const finalSalaryMin = salary_min !== undefined && salary_min !== null ? salary_min : 0;
+    const finalSalaryMax = salary_max !== undefined && salary_max !== null ? salary_max : 0;
+    const finalIsSalaryVisible = is_salary_visible !== undefined && is_salary_visible !== null ? is_salary_visible : false;
+
     const query = {
-      text: 'INSERT INTO jobs(id, company_id, category_id, title, description, job_type, experience_level, location_type, location_city, salary_min, salary_max, is_salary_visible, status, created_at, updated_at) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id',
-      values: [id, company_id, category_id, title, description, job_type, experience_level, location_type, location_city, salary_min, salary_max, is_salary_visible, status, createdAt, createdAt],
+      text: `INSERT INTO jobs(
+        id, company_id, category_id, title, description, job_type, experience_level,
+        location_type, location_city, salary_min, salary_max, is_salary_visible, status,
+        created_at, updated_at
+      ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
+      values: [
+        id,
+        company_id,
+        category_id,
+        title,
+        description,
+        job_type,
+        experience_level,
+        location_type,
+        finalLocationCity,
+        finalSalaryMin,
+        finalSalaryMax,
+        finalIsSalaryVisible,
+        status,
+        createdAt,
+        createdAt,
+      ],
     };
+
     const result = await pool.query(query);
 
-    res.status(201).json({ status: 'success', data: { id: result.rows[0].id } });
+    res.status(201).json({
+      status: 'success',
+      data: {
+        id: result.rows[0].id,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 2. GET All Jobs (Dengan filter by company_id & category_id)
+// Get All Jobs (Search by title & company-name, with company_name join)
 app.get('/jobs', async (req, res) => {
   try {
-    const { company_id, category_id } = req.query;
-    let queryText = 'SELECT * FROM jobs';
+    const { title, 'company-name': companyNameKebab, company_name } = req.query;
+    const companyFilter = (companyNameKebab || company_name || '').trim();
+    const titleFilter = (title || '').trim();
+
+    let queryText = `
+      SELECT jobs.*, companies.name AS company_name
+      FROM jobs
+      LEFT JOIN companies ON jobs.company_id = companies.id
+    `;
+    const conditions = [];
     const values = [];
 
-    if (company_id) {
-      queryText += ' WHERE company_id = $1';
-      values.push(company_id);
-    } else if (category_id) {
-      queryText += ' WHERE category_id = $1';
-      values.push(category_id);
+    if (titleFilter) {
+      values.push(`%${titleFilter}%`);
+      conditions.push(`jobs.title ILIKE $${values.length}`);
+    }
+
+    if (companyFilter) {
+      values.push(`%${companyFilter}%`);
+      conditions.push(`companies.name ILIKE $${values.length}`);
+    }
+
+    if (conditions.length > 0) {
+      queryText += ' WHERE ' + conditions.join(' AND ');
     }
 
     const result = await pool.query(queryText, values);
-    res.status(200).json({ status: 'success', data: { jobs: result.rows } });
+    res.status(200).json({
+      status: 'success',
+      data: {
+        jobs: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// --- ENDPOINT TAMBAHAN JOBS (By Company & Category) ---
-
-// GET Jobs by Company ID
+// Get Jobs by Company ID
 app.get('/jobs/company/:companyId', async (req, res) => {
   try {
     const { companyId } = req.params;
-    const result = await pool.query('SELECT * FROM jobs WHERE company_id = $1', [companyId]);
-    res.status(200).json({ status: 'success', data: { jobs: result.rows } });
+    const query = {
+      text: `SELECT jobs.*, companies.name AS company_name
+             FROM jobs
+             LEFT JOIN companies ON jobs.company_id = companies.id
+             WHERE jobs.company_id = $1`,
+      values: [companyId],
+    };
+    const result = await pool.query(query);
+    res.status(200).json({
+      status: 'success',
+      data: {
+        jobs: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 3. GET Jobs by Category ID
+// Get Jobs by Category ID
 app.get('/jobs/category/:categoryId', async (req, res) => {
   try {
     const { categoryId } = req.params;
-    const result = await pool.query('SELECT * FROM jobs WHERE category_id = $1', [categoryId]);
-    res.status(200).json({ status: 'success', data: { jobs: result.rows } });
+    const query = {
+      text: `SELECT jobs.*, companies.name AS company_name
+             FROM jobs
+             LEFT JOIN companies ON jobs.company_id = companies.id
+             WHERE jobs.category_id = $1`,
+      values: [categoryId],
+    };
+    const result = await pool.query(query);
+    res.status(200).json({
+      status: 'success',
+      data: {
+        jobs: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 4. GET Job By ID
+// Get Job by ID
 app.get('/jobs/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
-    
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Pekerjaan tidak ditemukan' });
-    res.status(200).json({ status: 'success', data: { job: result.rows[0] } });
-  } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
-  }
-});
-
-// 5. PUT Update Job
-app.put('/jobs/:id', verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { error } = jobSchema.validate(req.body);
-    if (error) return res.status(400).json({ status: 'failed', message: error.details[0].message });
-
-    const { company_id, category_id, title, description, job_type, experience_level, location_type, location_city, salary_min, salary_max, is_salary_visible, status } = req.body;
-    const updatedAt = new Date().toISOString();
-
     const query = {
-      text: 'UPDATE jobs SET company_id = $1, category_id = $2, title = $3, description = $4, job_type = $5, experience_level = $6, location_type = $7, location_city = $8, salary_min = $9, salary_max = $10, is_salary_visible = $11, status = $12, updated_at = $13 WHERE id = $14 RETURNING id',
-      values: [company_id, category_id, title, description, job_type, experience_level, location_type, location_city, salary_min, salary_max, is_salary_visible, status, updatedAt, id],
+      text: `SELECT jobs.*, companies.name AS company_name
+             FROM jobs
+             LEFT JOIN companies ON jobs.company_id = companies.id
+             WHERE jobs.id = $1`,
+      values: [id],
     };
     const result = await pool.query(query);
 
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Pekerjaan tidak ditemukan' });
-    res.status(200).json({ status: 'success', message: 'Pekerjaan berhasil diperbarui' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Pekerjaan tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      data: result.rows[0],
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-//6. DELETE Job
+// Update Job
+app.put('/jobs/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const checkJob = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+    if (checkJob.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Pekerjaan tidak ditemukan',
+      });
+    }
+
+    const { error } = jobSchema.validate(req.body);
+    if (error) {
+      return res.status(400).json({
+        status: 'failed',
+        message: error.details[0].message,
+      });
+    }
+
+    const {
+      company_id,
+      category_id,
+      title,
+      description,
+      job_type,
+      experience_level,
+      location_type,
+      location_city,
+      salary_min,
+      salary_max,
+      is_salary_visible,
+      status,
+    } = req.body;
+    const updatedAt = new Date().toISOString();
+
+    const finalLocationCity = location_city !== undefined ? location_city : '';
+    const finalSalaryMin = salary_min !== undefined && salary_min !== null ? salary_min : 0;
+    const finalSalaryMax = salary_max !== undefined && salary_max !== null ? salary_max : 0;
+    const finalIsSalaryVisible = is_salary_visible !== undefined && is_salary_visible !== null ? is_salary_visible : false;
+
+    const query = {
+      text: `UPDATE jobs SET
+        company_id = $1, category_id = $2, title = $3, description = $4,
+        job_type = $5, experience_level = $6, location_type = $7, location_city = $8,
+        salary_min = $9, salary_max = $10, is_salary_visible = $11, status = $12,
+        updated_at = $13 WHERE id = $14 RETURNING id`,
+      values: [
+        company_id,
+        category_id,
+        title,
+        description,
+        job_type,
+        experience_level,
+        location_type,
+        finalLocationCity,
+        finalSalaryMin,
+        finalSalaryMax,
+        finalIsSalaryVisible,
+        status,
+        updatedAt,
+        id,
+      ],
+    };
+
+    const result = await pool.query(query);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Pekerjaan tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Pekerjaan berhasil diperbarui',
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
+  }
+});
+
+// Delete Job
 app.delete('/jobs/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query('DELETE FROM jobs WHERE id = $1 RETURNING id', [id]);
 
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Pekerjaan tidak ditemukan' });
-    res.status(200).json({ status: 'success', message: 'Pekerjaan berhasil dihapus' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Pekerjaan tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Pekerjaan berhasil dihapus',
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// --- ENDPOINT APPLICATIONS ---
+// ==========================================
+// 6. ENDPOINT APPLICATIONS (Semua Dilindungi verifyToken)
+// ==========================================
 
 const applicationSchema = Joi.object({
   user_id: Joi.string().required(),
   job_id: Joi.string().required(),
-  status: Joi.string().required()
-});
+  status: Joi.string().default('pending').optional(),
+}).unknown(true);
 
-// 1. POST Add Application
+// Apply for Job
 app.post('/applications', verifyToken, async (req, res) => {
   try {
     const { error } = applicationSchema.validate(req.body);
-    if (error) return res.status(400).json({ status: 'failed', message: error.details[0].message });
+    if (error) {
+      return res.status(400).json({
+        status: 'failed',
+        message: error.details[0].message,
+      });
+    }
 
-    const { user_id, job_id, status } = req.body;
-    
-    // Cek apakah user dan job valid
+    const { user_id, job_id, status = 'pending' } = req.body;
+
     const checkUser = await pool.query('SELECT id FROM users WHERE id = $1', [user_id]);
     const checkJob = await pool.query('SELECT id FROM jobs WHERE id = $1', [job_id]);
-    
+
     if (checkUser.rows.length === 0 || checkJob.rows.length === 0) {
-      return res.status(404).json({ status: 'failed', message: 'User atau Job tidak ditemukan' });
+      return res.status(404).json({
+        status: 'failed',
+        message: 'User atau Job tidak ditemukan',
+      });
     }
 
     const id = `application-${crypto.randomUUID()}`;
@@ -698,66 +1031,128 @@ app.post('/applications', verifyToken, async (req, res) => {
     };
     const result = await pool.query(query);
 
-    res.status(201).json({ status: 'success', data: { id: result.rows[0].id } });
+    res.status(201).json({
+      status: 'success',
+      data: {
+        id: result.rows[0].id,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 2. GET All Applications
-app.get('/applications', async (req, res) => {
+// Get All Applications
+app.get('/applications', verifyToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM applications');
-    res.status(200).json({ status: 'success', data: { applications: result.rows } });
+    res.status(200).json({
+      status: 'success',
+      data: {
+        applications: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 3. GET Application By ID
-app.get('/applications/:id', async (req, res) => {
+// Get Application by ID
+app.get('/applications/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query('SELECT * FROM applications WHERE id = $1', [id]);
-    
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Application tidak ditemukan' });
-    res.status(200).json({ status: 'success', data: { application: result.rows[0] } });
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Application tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      data: result.rows[0],
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 4. GET Applications by User ID
-app.get('/applications/user/:userId', async (req, res) => {
+// Get Applications by User ID
+app.get('/applications/user/:userId', verifyToken, async (req, res) => {
   try {
     const { userId } = req.params;
     const result = await pool.query('SELECT * FROM applications WHERE user_id = $1', [userId]);
-    res.status(200).json({ status: 'success', data: { applications: result.rows } });
+    res.status(200).json({
+      status: 'success',
+      data: {
+        applications: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 5. GET Applications by Job ID
-app.get('/applications/job/:jobId', async (req, res) => {
+// Get Applications by Job ID
+app.get('/applications/job/:jobId', verifyToken, async (req, res) => {
   try {
     const { jobId } = req.params;
     const result = await pool.query('SELECT * FROM applications WHERE job_id = $1', [jobId]);
-    res.status(200).json({ status: 'success', data: { applications: result.rows } });
+    res.status(200).json({
+      status: 'success',
+      data: {
+        applications: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 6. PUT Update Application Status
+// Update Application Status
 app.put('/applications/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
-    // Mengizinkan update walau cuma ngirim status
+
+    const checkApp = await pool.query('SELECT * FROM applications WHERE id = $1', [id]);
+    if (checkApp.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Application tidak ditemukan',
+      });
+    }
+
     const schema = Joi.object({ status: Joi.string().required() }).unknown(true);
-    
+
     const { error } = schema.validate(req.body);
-    if (error) return res.status(400).json({ status: 'failed', message: error.details[0].message });
+    if (error) {
+      return res.status(400).json({
+        status: 'failed',
+        message: error.details[0].message,
+      });
+    }
 
     const { status } = req.body;
     const updatedAt = new Date().toISOString();
@@ -768,47 +1163,78 @@ app.put('/applications/:id', verifyToken, async (req, res) => {
     };
     const result = await pool.query(query);
 
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Application tidak ditemukan' });
-    res.status(200).json({ status: 'success', message: 'Application berhasil diperbarui' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Application tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Application berhasil diperbarui',
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 7. DELETE Application
+// Delete Application
 app.delete('/applications/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query('DELETE FROM applications WHERE id = $1 RETURNING id', [id]);
 
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Application tidak ditemukan' });
-    res.status(200).json({ status: 'success', message: 'Application berhasil dihapus' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Application tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Application berhasil dihapus',
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// --- ENDPOINT BOOKMARKS ---
+// ==========================================
+// 7. ENDPOINT BOOKMARKS (Sesuai Rute Kontrak Dicoding)
+// ==========================================
 
-const bookmarkSchema = Joi.object({
-  user_id: Joi.string().required(),
-  job_id: Joi.string().required()
-});
-
-// 1. POST Add Bookmark
-app.post('/bookmarks', verifyToken, async (req, res) => {
+// Add Bookmark: POST /jobs/:jobId/bookmark
+app.post('/jobs/:jobId/bookmark', verifyToken, async (req, res) => {
   try {
-    const { error } = bookmarkSchema.validate(req.body);
-    if (error) return res.status(400).json({ status: 'failed', message: error.details[0].message });
+    const { jobId } = req.params;
+    const userId = req.user.id;
 
-    const { user_id, job_id } = req.body;
-    
-    // Cek apakah user dan job valid
-    const checkUser = await pool.query('SELECT id FROM users WHERE id = $1', [user_id]);
-    const checkJob = await pool.query('SELECT id FROM jobs WHERE id = $1', [job_id]);
-    
-    if (checkUser.rows.length === 0 || checkJob.rows.length === 0) {
-      return res.status(404).json({ status: 'failed', message: 'User atau Job tidak ditemukan' });
+    const checkJob = await pool.query('SELECT id FROM jobs WHERE id = $1', [jobId]);
+    if (checkJob.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Pekerjaan tidak ditemukan',
+      });
+    }
+
+    const checkExisting = await pool.query('SELECT id FROM bookmarks WHERE user_id = $1 AND job_id = $2', [userId, jobId]);
+    if (checkExisting.rows.length > 0) {
+      return res.status(201).json({
+        status: 'success',
+        data: {
+          id: checkExisting.rows[0].id,
+        },
+      });
     }
 
     const id = `bookmark-${crypto.randomUUID()}`;
@@ -816,97 +1242,337 @@ app.post('/bookmarks', verifyToken, async (req, res) => {
 
     const query = {
       text: 'INSERT INTO bookmarks(id, user_id, job_id, created_at, updated_at) VALUES($1, $2, $3, $4, $5) RETURNING id',
-      values: [id, user_id, job_id, createdAt, createdAt],
+      values: [id, userId, jobId, createdAt, createdAt],
     };
     const result = await pool.query(query);
 
-    res.status(201).json({ status: 'success', data: { id: result.rows[0].id } });
+    res.status(201).json({
+      status: 'success',
+      data: {
+        id: result.rows[0].id,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 2. GET All Bookmarks
-app.get('/bookmarks', async (req, res) => {
+// Get All Bookmarks of Current User: GET /bookmarks
+app.get('/bookmarks', verifyToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM bookmarks');
-    res.status(200).json({ status: 'success', data: { bookmarks: result.rows } });
+    const userId = req.user.id;
+    const result = await pool.query('SELECT * FROM bookmarks WHERE user_id = $1', [userId]);
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        bookmarks: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 3. GET Bookmark By ID
-app.get('/bookmarks/:id', async (req, res) => {
+// Get Bookmark by ID: GET /jobs/:jobId/bookmark/:bookmarkId
+app.get('/jobs/:jobId/bookmark/:bookmarkId', verifyToken, async (req, res) => {
+  try {
+    const { bookmarkId } = req.params;
+    const result = await pool.query('SELECT * FROM bookmarks WHERE id = $1', [bookmarkId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Bookmark tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      data: result.rows[0],
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
+  }
+});
+
+// Delete Bookmark: DELETE /jobs/:jobId/bookmark
+app.delete('/jobs/:jobId/bookmark', verifyToken, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.user.id;
+
+    await pool.query('DELETE FROM bookmarks WHERE user_id = $1 AND job_id = $2', [userId, jobId]);
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Bookmark berhasil dihapus',
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
+  }
+});
+
+// --- ENDPOINT BOOKMARKS TAMBAHAN (Direct CRUD) ---
+
+// Create Bookmark: POST /bookmarks
+app.post('/bookmarks', verifyToken, async (req, res) => {
+  try {
+    const { job_id, user_id } = req.body;
+    const finalUserId = user_id || req.user.id;
+
+    if (!job_id) {
+      return res.status(400).json({
+        status: 'failed',
+        message: 'job_id wajib diisi',
+      });
+    }
+
+    const checkJob = await pool.query('SELECT id FROM jobs WHERE id = $1', [job_id]);
+    if (checkJob.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Pekerjaan tidak ditemukan',
+      });
+    }
+
+    const checkExisting = await pool.query('SELECT id FROM bookmarks WHERE user_id = $1 AND job_id = $2', [finalUserId, job_id]);
+    if (checkExisting.rows.length > 0) {
+      return res.status(201).json({
+        status: 'success',
+        data: { id: checkExisting.rows[0].id },
+      });
+    }
+
+    const id = `bookmark-${crypto.randomUUID()}`;
+    const createdAt = new Date().toISOString();
+    const query = {
+      text: 'INSERT INTO bookmarks(id, user_id, job_id, created_at, updated_at) VALUES($1, $2, $3, $4, $5) RETURNING id',
+      values: [id, finalUserId, job_id, createdAt, createdAt],
+    };
+    const result = await pool.query(query);
+
+    res.status(201).json({
+      status: 'success',
+      data: { id: result.rows[0].id },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
+  }
+});
+
+// Get Bookmark by ID: GET /bookmarks/:id
+app.get('/bookmarks/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query('SELECT * FROM bookmarks WHERE id = $1', [id]);
-    
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Bookmark tidak ditemukan' });
-    res.status(200).json({ status: 'success', data: { bookmark: result.rows[0] } });
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Bookmark tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      data: result.rows[0],
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 4. GET Bookmarks by User ID
-app.get('/bookmarks/user/:userId', async (req, res) => {
+// Get Bookmarks by User ID: GET /bookmarks/user/:userId
+app.get('/bookmarks/user/:userId', verifyToken, async (req, res) => {
   try {
     const { userId } = req.params;
     const result = await pool.query('SELECT * FROM bookmarks WHERE user_id = $1', [userId]);
-    res.status(200).json({ status: 'success', data: { bookmarks: result.rows } });
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        bookmarks: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 5. GET Bookmarks by Job ID
-app.get('/bookmarks/job/:jobId', async (req, res) => {
+// Get Bookmarks by Job ID: GET /bookmarks/job/:jobId
+app.get('/bookmarks/job/:jobId', verifyToken, async (req, res) => {
   try {
     const { jobId } = req.params;
     const result = await pool.query('SELECT * FROM bookmarks WHERE job_id = $1', [jobId]);
-    res.status(200).json({ status: 'success', data: { bookmarks: result.rows } });
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        bookmarks: result.rows,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-// 6. PUT Update Bookmark
-app.put('/bookmarks/:id', verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { error } = bookmarkSchema.validate(req.body);
-    if (error) return res.status(400).json({ status: 'failed', message: error.details[0].message });
-
-    const { user_id, job_id } = req.body;
-    const updatedAt = new Date().toISOString();
-
-    const query = {
-      text: 'UPDATE bookmarks SET user_id = $1, job_id = $2, updated_at = $3 WHERE id = $4 RETURNING id',
-      values: [user_id, job_id, updatedAt, id],
-    };
-    const result = await pool.query(query);
-
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Bookmark tidak ditemukan' });
-    res.status(200).json({ status: 'success', message: 'Bookmark berhasil diperbarui' });
-  } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
-  }
-});
-
-// 7. DELETE Bookmark
+// Delete Bookmark by ID: DELETE /bookmarks/:id
 app.delete('/bookmarks/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query('DELETE FROM bookmarks WHERE id = $1 RETURNING id', [id]);
 
-    if (result.rows.length === 0) return res.status(404).json({ status: 'failed', message: 'Bookmark tidak ditemukan' });
-    res.status(200).json({ status: 'success', message: 'Bookmark berhasil dihapus' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'Bookmark tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Bookmark berhasil dihapus',
+    });
   } catch (error) {
-    res.status(500).json({ status: 'error', message: 'Terjadi kegagalan pada server kami' });
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
   }
 });
 
-app.listen(port, host, () => {
+// ==========================================
+// 8. ENDPOINT OPSIONAL (PROFILE)
+// ==========================================
+
+// Get Profile
+app.get('/profile', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const query = {
+      text: "SELECT id, fullname AS name, email, COALESCE(role, 'user') AS role FROM users WHERE id = $1",
+      values: [userId],
+    };
+    const result = await pool.query(query);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: 'failed',
+        message: 'User tidak ditemukan',
+      });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        id: result.rows[0].id,
+        name: result.rows[0].name,
+        email: result.rows[0].email,
+        role: result.rows[0].role || 'user',
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
+  }
+});
+
+// Get Profile Applications
+app.get('/profile/applications', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await pool.query('SELECT * FROM applications WHERE user_id = $1', [userId]);
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        applications: result.rows,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
+  }
+});
+
+// Get Profile Bookmarks
+app.get('/profile/bookmarks', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await pool.query('SELECT * FROM bookmarks WHERE user_id = $1', [userId]);
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        bookmarks: result.rows,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Terjadi kegagalan pada server kami',
+    });
+  }
+});
+
+// Fallback 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    status: 'failed',
+    message: 'Resource tidak ditemukan',
+  });
+});
+
+// --- MIDDLEWARE ERROR HANDLING (4 arguments) ---
+app.use((err, req, res, next) => {
+  console.error(err.stack || err);
+  res.status(500).json({
+    status: 'error',
+    message: 'Terjadi kegagalan pada server kami',
+  });
+});
+
+app.listen(port, () => {
   console.log(`Server berjalan pada http://${host}:${port}`);
 });
