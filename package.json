@@ -5,7 +5,7 @@
   "scripts": {
     "start:dev": "nodemon index.js",
     "migrate": "node-pg-migrate",
-    "migrate:up": "node -e \"require('dotenv').config(); require('child_process').execSync('npm run migrate up', {stdio: 'inherit'})\"",
+    "migrate:up": "node-pg-migrate up",
     "db:clean": "node -e \"require('./db').query('TRUNCATE TABLE bookmarks, applications, jobs, categories, companies, authentications, users CASCADE').then(() => { console.log('Database telah bersih!'); process.exit(0); });\""
   },
   "dependencies": {

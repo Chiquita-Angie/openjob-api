@@ -270,7 +270,7 @@ app.put('/authentications', async (req, res) => {
 });
 
 // Logout
-app.delete('/authentications', async (req, res) => {
+app.delete('/authentications', verifyToken, async (req, res) => {
   try {
     const schema = Joi.object({
       refreshToken: Joi.string().required(),
@@ -285,6 +285,15 @@ app.delete('/authentications', async (req, res) => {
     }
 
     const { refreshToken } = req.body;
+
+    try {
+      jwt.verify(refreshToken, process.env.REFRESH_TOKEN_KEY);
+    } catch (err) {
+      return res.status(400).json({
+        status: 'failed',
+        message: 'Refresh token tidak valid',
+      });
+    }
 
     const checkToken = await pool.query('SELECT token FROM authentications WHERE token = $1', [refreshToken]);
     if (checkToken.rows.length === 0) {
